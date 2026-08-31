@@ -1,156 +1,166 @@
-"""
-Food classification model using MobileNetV2 pre-trained on ImageNet.
-
-The model predicts ImageNet class labels; we then map those labels to
-our supported food categories so we can return nutrition data.
-"""
+"""Food image classification using EfficientNet with food-awareness boost."""
 
 from __future__ import annotations
 
-import io
+import time
 import logging
-from functools import lru_cache
-from typing import Optional
+from typing import Dict, List, Any
 
-import torch
-import torchvision.models as models
-import torchvision.transforms as transforms
+import numpy as np
 from PIL import Image
+
+from nutrition_data import NUTRITION_DATA, normalize_food_label, calculate_meal_quality_score
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# ImageNet class labels that belong to each of our food categories.
-# Keeping only the labels most relevant to food classification.
-# ---------------------------------------------------------------------------
-
-FOOD_LABEL_MAPPING: dict[str, list[str]] = {
-    "pizza": ["pizza"],
-    "burger": ["hamburger", "cheeseburger", "hotdog", "hot dog"],
-    "hot dog": ["hotdog", "hot dog"],
-    "french fries": ["french loaf", "french fries"],
-    "ice cream": ["ice cream", "ice lolly", "popsicle"],
-    "apple pie": ["apple pie"],
-    "donut": ["doughnut", "donut"],
-    "waffles": ["waffle"],
-    "pancakes": ["pancake"],
-    "sushi": ["sushi"],
-    "soup": ["consomme", "chowder", "hotpot", "soup bowl"],
-    "steak": ["beef", "steak", "meat loaf", "meatloaf"],
-    "chicken": ["hen", "chicken", "cock", "drumstick", "fried chicken"],
-    "fish": ["fish", "tench", "goldfish", "shark", "ray"],
-    "rice": ["rice", "pilaf"],
-    "pasta": ["spaghetti", "pasta", "lasagna", "carbonara"],
-    "salad": ["salad", "broccoli", "spinach", "cauliflower", "head cabbage"],
-    "sandwich": ["sandwich", "club sandwich", "submarine", "hoagie"],
-    "tacos": ["taco", "burrito"],
-    "nachos": ["nacho"],
-    "omelette": ["omelette", "omelet"],
-    "fried rice": ["fried rice"],
-}
-
-# Reverse mapping: imagenet_label_fragment -> food_category
-_REVERSE_MAP: dict[str, str] = {}
-for food_cat, imagenet_labels in FOOD_LABEL_MAPPING.items():
-    for lbl in imagenet_labels:
-        _REVERSE_MAP[lbl.lower()] = food_cat
+CONFIDENCE_THRESHOLD = 0.15
 
 
-def _build_imagenet_labels() -> list[str]:
-    """Load ImageNet 1k class labels bundled with torchvision."""
-    try:
-        from torchvision.models import MobileNet_V2_Weights
-        weights = MobileNet_V2_Weights.DEFAULT
-        meta = weights.meta
-        return [v.lower() for v in meta["categories"]]
-    except Exception:
-        # Fallback – return empty list; we will handle gracefully
-        return []
-
-
-@lru_cache(maxsize=1)
-def load_model() -> tuple:
+class FoodClassifier:
+    """Food recognition using EfficientNet with food-specific boost.
+    
+    This classifier uses EfficientNet pre-trained on ImageNet but applies
+    food-specific confidence boosting for food-related predictions to improve
+    food recognition accuracy.
     """
-    Load MobileNetV2 pretrained on ImageNet.
-    Returns (model, transform, imagenet_labels).
-    Cached so we only load once.
-    """
-    logger.info("Loading MobileNetV2 model…")
-    try:
-        weights = models.MobileNet_V2_Weights.DEFAULT
-        model = models.mobilenet_v2(weights=weights)
-        model.eval()
-        transform = weights.transforms()
-        imagenet_labels = [v.lower() for v in weights.meta["categories"]]
-        logger.info("MobileNetV2 loaded successfully.")
-        return model, transform, imagenet_labels
-    except Exception as exc:
-        logger.error("Failed to load MobileNetV2: %s", exc)
-        raise
 
+    def __init__(self, threshold: float = CONFIDENCE_THRESHOLD) -> None:
+        self.threshold = threshold
+        try:
+            from tensorflow.keras.applications import EfficientNetB0
+            self.model = EfficientNetB0(weights="imagenet")
+            self.use_efficient = True
+            logger.info("Loaded EfficientNetB0 model")
+        except Exception as e:
+            logger.warning(f"Could not load EfficientNetB0: {e}. Using MobileNetV2 fallback.")
+            # Fallback to MobileNetV2
+            from tensorflow.keras.applications import MobileNetV2
+            self.model = MobileNetV2(weights="imagenet")
+            self.use_efficient = False
 
-def _map_imagenet_to_food(label: str) -> Optional[str]:
-    """Map an ImageNet label string to a food category, or return None."""
-    label_lower = label.lower()
-    # Exact / substring match against our reverse map
-    for key, food_cat in _REVERSE_MAP.items():
-        if key in label_lower or label_lower in key:
-            return food_cat
-    return None
+        # Food keywords for confidence boosting
+        self.food_keywords = {
+            "pizza", "burger", "hot dog", "sandwich", "sushi", "taco",
+            "pasta", "noodles", "rice", "chicken", "fish", "steak", "beef",
+            "pork", "lamb", "salad", "soup", "bread", "toast", "bagel",
+            "cake", "ice cream", "donut", "cookie", "chocolate", "fruit",
+            "vegetable", "apple", "banana", "orange", "strawberry", "grape",
+            "egg", "cheese", "milk", "yogurt", "pancake", "waffle", "fries",
+            "chips", "nuts", "popcorn", "croissant", "broccoli", "spinach",
+            "corn", "peas", "beans", "potato", "tomato", "carrot", "lettuce",
+            "cucumber", "mushroom", "wrap", "burrito", "enchilada", "ramen",
+            "pad thai", "curry", "naan", "samosa", "spring roll", "nacho",
+            "sauce", "dressing", "gravy", "roast", "grilled", "fried", "baked",
+            "boiled", "steamed", "raw", "fresh", "cooked", "meal", "food",
+            "dinner", "lunch", "breakfast", "dessert", "appetizer", "snack",
+            "dish", "plate", "bowl", "serving", "portion", "cuisine"
+        }
 
+    def _top_predictions(self, image: Image.Image, top_k: int = 20) -> List[Dict[str, Any]]:
+        """Get top predictions and boost food-related ones."""
+        resized = image.resize((224, 224), Image.Resampling.LANCZOS)
+        array = np.array(resized).astype("float32")
+        
+        if self.use_efficient:
+            from tensorflow.keras.applications.efficientnet import preprocess_input
+        else:
+            from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+        
+        from tensorflow.keras.applications.imagenet_utils import decode_predictions
+        
+        preprocessed = preprocess_input(array)[np.newaxis, ...]
+        predictions = self.model.predict(preprocessed, verbose=0)
+        decoded = decode_predictions(predictions, top=top_k)
 
-def classify_image(image_bytes: bytes, top_k: int = 5) -> dict:
-    """
-    Classify a food image.
+        results: List[Dict[str, Any]] = []
+        for _, label, score in decoded[0]:
+            confidence = float(score)
+            
+            # Apply food-specific confidence boost
+            label_lower = label.lower().replace("_", " ")
+            if any(keyword in label_lower for keyword in self.food_keywords):
+                # Boost confidence for food-related predictions
+                confidence = min(1.0, confidence * 1.5)
+            
+            results.append({
+                "label": label,
+                "confidence": confidence,
+            })
+        
+        return results
 
-    Parameters
-    ----------
-    image_bytes : bytes
-        Raw image data.
-    top_k : int
-        Number of top predictions to consider when mapping to food category.
+    def predict(self, image: Image.Image) -> Dict[str, Any]:
+        started = time.perf_counter()
+        raw_predictions = self._top_predictions(image)
+        
+        # DEBUG: Log raw predictions
+        logger.info(f"\nTOP RAW PREDICTIONS:")
+        for i, pred in enumerate(raw_predictions[:5], 1):
+            logger.info(f"  {i}. {pred['label']}: {pred['confidence']*100:.2f}%")
 
-    Returns
-    -------
-    dict with keys: food_label (str), confidence (float), raw_labels (list)
-    """
-    model, transform, imagenet_labels = load_model()
+        best_match: Dict[str, Any] | None = None
+        best_matches_tried = []
+        
+        for prediction in raw_predictions:
+            normalized = normalize_food_label(prediction["label"])
+            best_matches_tried.append((prediction["label"], normalized, normalized in NUTRITION_DATA))
+            
+            if normalized not in NUTRITION_DATA:
+                continue
 
-    # Pre-process image
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    tensor = transform(image).unsqueeze(0)  # shape: (1, 3, H, W)
+            candidate = {
+                "label": normalized,
+                "confidence": float(prediction["confidence"]),
+            }
+            if best_match is None or candidate["confidence"] > best_match["confidence"]:
+                best_match = candidate
+        
+        # DEBUG: Log normalization results
+        logger.info(f"\nNORMALIZATION & LOOKUP:")
+        for original, normalized, in_db in best_matches_tried[:5]:
+            logger.info(f"  '{original}' → '{normalized}' {'[IN DB]' if in_db else '[NOT FOUND]'}")
 
-    with torch.no_grad():
-        logits = model(tensor)
-        probabilities = torch.softmax(logits, dim=1)[0]
+        if best_match is None:
+            logger.info(f"\nRESULT: No food detected")
+            return {
+                "success": False,
+                "food": None,
+                "confidence": 0,
+                "message": "No food detected. Please upload a clear food image.",
+                "raw_labels": raw_predictions[:5],
+                "inference_time_ms": round((time.perf_counter() - started) * 1000, 2),
+            }
 
-    top_probs, top_indices = torch.topk(probabilities, k=min(top_k, len(imagenet_labels)))
-    top_labels = [imagenet_labels[idx.item()] for idx in top_indices]
-    top_confidences = [float(p) for p in top_probs]
+        if best_match["confidence"] < self.threshold:
+            logger.info(f"\nRESULT: Confidence too low ({best_match['confidence']*100:.2f}% < {self.threshold*100:.2f}%)")
+            return {
+                "success": False,
+                "food": None,
+                "confidence": 0,
+                "message": "Confidence too low. Please try a clearer food image.",
+                "raw_labels": raw_predictions[:5],
+                "inference_time_ms": round((time.perf_counter() - started) * 1000, 2),
+            }
 
-    raw_labels = [
-        {"label": lbl, "confidence": round(conf * 100, 2)}
-        for lbl, conf in zip(top_labels, top_confidences)
-    ]
+        nutrition = NUTRITION_DATA[best_match["label"]]
+        score = calculate_meal_quality_score(nutrition)
+        
+        logger.info(f"\nRESULT: SUCCESS")
+        logger.info(f"  Food: {best_match['label']}")
+        logger.info(f"  Confidence: {best_match['confidence']*100:.2f}%")
+        logger.info(f"  Calories: {nutrition['calories']}")
 
-    # Find the first top prediction that maps to a food category
-    food_label = None
-    confidence = 0.0
-    for lbl, conf in zip(top_labels, top_confidences):
-        mapped = _map_imagenet_to_food(lbl)
-        if mapped:
-            food_label = mapped
-            confidence = round(conf * 100, 2)
-            break
-
-    # Fallback: use the highest-confidence raw label even if unmapped
-    if food_label is None:
-        food_label = top_labels[0] if top_labels else "unknown"
-        confidence = top_confidences[0] * 100 if top_confidences else 0.0
-        confidence = round(confidence, 2)
-
-    return {
-        "food_label": food_label,
-        "confidence": confidence,
-        "raw_labels": raw_labels,
-    }
+        return {
+            "success": True,
+            "food": best_match["label"],
+            "confidence": round(best_match["confidence"] * 100, 1),
+            "calories": nutrition["calories"],
+            "protein": nutrition["protein"],
+            "carbs": nutrition["carbs"],
+            "fats": nutrition["fats"],
+            "fiber": nutrition["fiber"],
+            "serving": nutrition["serving"],
+            "meal_quality_score": score,
+            "raw_labels": [{"label": item["label"], "confidence": round(item["confidence"] * 100, 1)} for item in raw_predictions[:5]],
+            "inference_time_ms": round((time.perf_counter() - started) * 1000, 2),
+        }

@@ -1,6 +1,8 @@
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
-torch>=2.0.0
-torchvision>=0.15.0
-pillow>=10.0.0
-python-multipart>=0.0.9
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pillow==12.3.0
+numpy==2.5.2
+tensorflow==2.21.0
+huggingface-hub==0.23.0
+requests==2.32.0

@@ -1,30 +1,23 @@
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import './App.css'
-import Home from './Home'
-import Upload from './Upload'
-import Result from './Result'
-import Dashboard from './Dashboard'
+import { Navigate, Route, Routes } from 'react-router-dom';
+import Navbar from './components/Navbar';
+import Dashboard from './pages/Dashboard';
+import Home from './pages/Home';
+import Result from './pages/Result';
+import Upload from './pages/Upload';
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <div className="app-wrapper">
-        <nav className="navbar">
-          <span className="nav-brand">🍽️ MessFoodLens</span>
-          <div className="nav-links">
-            <NavLink to="/" end>Home</NavLink>
-            <NavLink to="/upload">Analyze</NavLink>
-            <NavLink to="/dashboard">Dashboard</NavLink>
-          </div>
-        </nav>
-
+    <div className="app-shell">
+      <Navbar />
+      <main className="main-content">
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/upload" element={<Upload />} />
           <Route path="/result" element={<Result />} />
           <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
-      </div>
-    </BrowserRouter>
-  )
+      </main>
+    </div>
+  );
 }

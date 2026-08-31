@@ -1,137 +1,124 @@
-"""
-MessFoodLens – FastAPI backend
-"""
-
 from __future__ import annotations
 
+import os
+from io import BytesIO
+from typing import Any
 import logging
-import time
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from PIL import Image, UnidentifiedImageError
 
-from model import classify_image
-from nutrition_data import get_nutrition
+from model import FoodClassifier
 
+# Configure debug logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# App lifecycle: pre-load model on startup so the first request is fast
-# ---------------------------------------------------------------------------
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Pre-loading ML model…")
-    try:
-        from model import load_model
-        load_model()
-        logger.info("Model ready.")
-    except Exception as exc:
-        logger.warning("Could not pre-load model: %s", exc)
-    yield
+app = FastAPI(title="MessFoodLens API")
 
-
-app = FastAPI(
-    title="MessFoodLens API",
-    description="Upload a food image and get nutrition information.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-# Allow the Vite dev server (and any other origin during development) to call
-# the API.  In production, restrict origins to your actual domain.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-ALLOWED_CONTENT_TYPES = {
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-    "image/webp",
-    "image/gif",
-}
-
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+classifier = FoodClassifier()
 
 
 @app.get("/")
-async def root():
-    return {"message": "MessFoodLens API is running. POST /analyze to detect food."}
+async def root() -> dict[str, str]:
+    return {"message": "MessFoodLens API is running"}
 
 
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health() -> dict[str, str]:
+    return {"status": "healthy"}
+
+
+def validate_uploaded_file(file: UploadFile, file_bytes: bytes) -> None:
+    if file.filename is None or file.filename.strip() == "":
+        raise HTTPException(status_code=400, detail="No file selected.")
+
+    if len(file_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds the 10 MB size limit.")
+
+    extension = os.path.splitext(file.filename)[1].lower()
+    content_type = file.content_type or ""
+
+    if content_type not in ALLOWED_IMAGE_TYPES and extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Unsupported file type. Please upload a JPEG, PNG, or WEBP image.")
+
+    try:
+        with Image.open(BytesIO(file_bytes)) as image:
+            image.verify()
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.")
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-    """
-    Receive an uploaded food image, classify it, and return nutrition data.
-
-    Returns JSON:
-    {
-        "food": "pizza",
-        "confidence": 87.3,
-        "calories": 285,
-        "protein": "12g",
-        "carbs": "36g",
-        "fats": "10g",
-        "fiber": "2g",
-        "serving": "1 slice (107g)",
-        "meal_quality_score": 55,
-        "raw_labels": [...]
-    }
-    """
-    # Validate content type
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{file.content_type}'. "
-                   "Please upload a JPEG, PNG, WEBP or GIF image.",
-        )
-
-    # Read & size-check
-    image_bytes = await file.read()
-    if len(image_bytes) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="File too large. Maximum allowed size is 10 MB.",
-        )
-
-    if len(image_bytes) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    start = time.perf_counter()
+async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
     try:
-        classification = classify_image(image_bytes)
-    except Exception as exc:
-        logger.exception("Model inference failed")
-        raise HTTPException(status_code=500, detail=f"Model inference failed: {exc}") from exc
+        file_bytes = await file.read()
+        validate_uploaded_file(file, file_bytes)
 
-    elapsed = round((time.perf_counter() - start) * 1000, 1)
-    logger.info(
-        "Classified as '%s' (%.1f%%) in %s ms",
-        classification["food_label"],
-        classification["confidence"],
-        elapsed,
-    )
+        # DEBUG: Log file information
+        logger.info(f"\n{'='*60}")
+        logger.info(f"ANALYZE REQUEST")
+        logger.info(f"Filename: {file.filename}")
+        logger.info(f"Content-Type: {file.content_type}")
+        logger.info(f"File size (bytes): {len(file_bytes)}")
+        logger.info(f"File hash (first 20 bytes): {file_bytes[:20].hex()}")
 
-    nutrition = get_nutrition(classification["food_label"])
+        with Image.open(BytesIO(file_bytes)) as pil_image:
+            rgb_image = pil_image.convert("RGB")
+            
+            # DEBUG: Log image properties
+            logger.info(f"Image mode: {rgb_image.mode}")
+            logger.info(f"Image size: {rgb_image.size}")
+            logger.info(f"Image format: {rgb_image.format}")
+            
+            result = classifier.predict(rgb_image)
+            
+            # DEBUG: Log results
+            logger.info(f"Prediction success: {result['success']}")
+            logger.info(f"Detected food: {result.get('food', 'N/A')}")
+            logger.info(f"Confidence: {result.get('confidence', 'N/A')}%")
+            logger.info(f"Raw labels: {result.get('raw_labels', [])[:3]}")
+            logger.info(f"{'='*60}\n")
 
-    return JSONResponse(
-        content={
-            **nutrition,
-            "confidence": classification["confidence"],
-            "raw_labels": classification["raw_labels"],
-            "inference_time_ms": elapsed,
-        }
-    )
+        if not result["success"]:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "success": False,
+                    "food": None,
+                    "confidence": 0,
+                    "message": result["message"],
+                    "raw_labels": result["raw_labels"],
+                    "inference_time_ms": result["inference_time_ms"],
+                },
+            )
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail="Unable to analyze the uploaded image.")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
